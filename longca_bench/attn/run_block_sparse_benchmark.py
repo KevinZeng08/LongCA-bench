@@ -340,7 +340,6 @@ def sparse_attn_benchmark(
                     orig_seq_len_k,
                     p_dropout=dropout_p,
                     softmax_scale=softmax_scale,
-                    sparse_block_size=q_block_size,
                 )
 
         elif attn_impl == "flashinfer":
@@ -370,11 +369,12 @@ def sparse_attn_benchmark(
             )
 
             # allocate 128MB workspace buffer
+            kv_lens_buffer_size = nhk * block_row_sz.shape[-1] + 1024
             workspace_buffer = torch.empty(
                 128 * 1024 * 1024, dtype=torch.uint8, device=block_mask.device
             )
             wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
-                workspace_buffer, backend="fa3"
+                workspace_buffer, backend="fa2", kv_lens_buffer_size=kv_lens_buffer_size
             )
 
             wrapper.plan(
