@@ -13,24 +13,33 @@ from baselines.utils import (
 from einops import rearrange
 
 from longca_bench.utils.benchmark import Benchmark, do_bench_flops, perf_report
-from magi_attention.utils.sparse_utils import (
+from longca_bench.utils.sparse_utils import (
     generate_block_sparse_pattern,
     get_sdpa_mask_from_block_sparse_mask,
 )
 
-impls = ["ffa", "flashinfer", "vsa", "vsa_triton", "flex"]
+impls = ["vsa_triton"]
 
 # actual seqlen
-seqlens = [49152, 16384]
+seqlens = [32768 * (i + 1) for i in range(0, 2)]
 
 sparsity_ratio = [0.1, 0.2, 0.5, 0.8, 1.0]
 # ss = [k * 1024 for k in [4, 96, 128]]
 ds = [128]
 wds = ["fwd", "bwd"]
 attn_modes = ["MHA"]  # MHA, GQA
-nhqs = [4]
-num_group = 4
-block_sizes = [64, 128]
+nhqs = [64]
+num_groups = [16] # only used for GQA
+# small K block
+# q_block_sizes = [64, 64, 64, 64, 64]
+# k_block_sizes = [64, 32, 16, 8, 1]
+# small Q block
+# q_block_sizes = [64, 32, 16, 8]
+# k_block_sizes = [64, 64, 64, 64]
+# large Q block and K block
+q_block_sizes = [64]
+k_block_sizes = [64]
+assert len(q_block_sizes) == len(k_block_sizes)
 
 b = 1
 
@@ -64,23 +73,26 @@ attn_flops_configs = [
         },
         plot_name=(
             f"block sparse attn-{wd} attn_mode-{attn_mode} "
-            f"{'n_head-' + str(nhq) if attn_mode == 'MHA' else f'n_head-{nhq}:{nhq // num_group}'} "
-            f"block_size-{block_size} seq_len {seqlen}"
+            f"{'n_head-' + str(nhq) if attn_mode == 'MHA' else f'n_head-{nhq}:{nhq // num_group}'}\n"
+            f"block_size-{q_block_size}:{k_block_size} seq_len {seqlen}"
         ),
         # Name for the plot. Used also as a file name for saving the plot.
         args={  # Values for function arguments not in `x_names` and `y_name`.
             "hd": hd,
             "wd": wd,
-            "block_size": block_size,
+            "q_block_size": q_block_size,
+            "k_block_size": k_block_size,
             "seqlen": seqlen,
+            "num_group": num_group,
             "attn_mode": attn_mode,
             "nhq": nhq,
         },
     )
     for hd in ds
     for wd in wds
-    for block_size in block_sizes
+    for q_block_size, k_block_size in zip(q_block_sizes, k_block_sizes)
     for seqlen in seqlens
+    for num_group in num_groups
     for attn_mode in attn_modes
     for nhq in nhqs
 ]
@@ -90,7 +102,16 @@ seed_everything()
 
 @perf_report(attn_flops_configs)
 def sparse_attn_benchmark(
-    sparsity_ratio, hd, wd, block_size, seqlen, attn_mode, nhq, attn_impl
+    sparsity_ratio,
+    hd,
+    wd,
+    q_block_size,
+    k_block_size,
+    seqlen,
+    num_group,
+    attn_mode,
+    nhq,
+    attn_impl,
 ):
     assert b == 1, "for now, we only supports b=1 for ffa"
     is_attn_impl_support_this_mask = True
@@ -100,7 +121,8 @@ def sparse_attn_benchmark(
 
     device = torch.cuda.current_device()
     orig_seq_len_q = orig_seq_len_k = seqlen  # fi square mask where sq == sk
-    block_m = block_n = block_size
+    block_m = q_block_size
+    block_n = k_block_size
 
     num_q_blocks_orig = orig_seq_len_q // block_m
     num_kv_blocks_orig = orig_seq_len_k // block_n
@@ -177,7 +199,7 @@ def sparse_attn_benchmark(
 
     # --------- prepare func --------- #
     is_attn_impl_support_this_mask = block_sparse_available(
-        attn_impl, nhq, nhk, block_size, wd
+        attn_impl, nhq, nhk, q_block_size, k_block_size, wd
     )
     if is_attn_impl_support_this_mask:
         if attn_impl == "vsa":
@@ -214,7 +236,8 @@ def sparse_attn_benchmark(
                 except Exception as e:
                     if "CUDA out of memory" not in str(e):
                         print(
-                            f"Error occured before running {attn_impl} with {block_size} mask "
+                            f"Error occured before running {attn_impl} with "
+                            f"{q_block_size=}, {k_block_size=} "
                             f"when {seqlen=}, {hd=} during {wd}: {e=}"
                         )
                         raise e
@@ -263,7 +286,8 @@ def sparse_attn_benchmark(
                 except Exception as e:
                     if "CUDA out of memory" not in str(e):
                         print(
-                            f"Error occured before running {attn_impl} with {block_size} mask "
+                            f"Error occured before running {attn_impl} with "
+                            f"{q_block_size=}, {k_block_size=} "
                             f"when {seqlen=}, {hd=} during {wd}: {e=}"
                         )
                         raise e
@@ -284,11 +308,49 @@ def sparse_attn_benchmark(
                         k2q_block_sparse_num,
                     )
 
+        elif attn_impl == "fa2_sparse":
+            try:
+                from block_sparse_attn import block_sparse_attn_func
+            except ImportError:
+                raise ImportError(
+                    "Please install FA2 sparse attention following \
+                    https://github.com/mit-han-lab/Block-Sparse-Attention/blob/main/README.md."
+                )
+
+            cu_seqlens = torch.arange(
+                0, (b + 1) * seqlen, step=seqlen, dtype=torch.int32, device=device
+            )
+            q = q.reshape(b * orig_seq_len_q, nhq, hd).contiguous()
+            k = k.reshape(b * orig_seq_len_k, nhk, hd).contiguous()
+            v = v.reshape(b * orig_seq_len_k, nhk, hd).contiguous()
+            head_mask_type = torch.tensor([1] * nhq, device=q.device, dtype=torch.int32)
+            streaming_info = None
+
+            def fn():
+                return block_sparse_attn_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens,
+                    cu_seqlens,
+                    head_mask_type,
+                    streaming_info,
+                    block_mask,
+                    orig_seq_len_q,
+                    orig_seq_len_k,
+                    p_dropout=dropout_p,
+                    softmax_scale=softmax_scale,
+                    sparse_block_size=q_block_size,
+                )
+
         elif attn_impl == "flashinfer":
             try:
                 import flashinfer
             except ImportError:
-                raise ImportError("Please install FlashInfer first.")
+                raise ImportError(
+                    "Please install FlashInfer v0.2.9 with this bug-fixed PR: \n"
+                    "https://github.com/flashinfer-ai/flashinfer/pull/1383"
+                )
 
             q = q.view(b * nhq, orig_seq_len_q, hd).contiguous()
             k = k.view(b * nhk, orig_seq_len_k, hd).contiguous()
@@ -336,7 +398,8 @@ def sparse_attn_benchmark(
             except Exception as e:
                 if "CUDA out of memory" not in str(e):
                     print(
-                        f"Error occured before running {attn_impl} with {block_size} mask "
+                        f"Error occured before running {attn_impl} with "
+                        f"{q_block_size=}, {k_block_size=} "
                         f"when {seqlen=}, {hd=} during {wd}: {e=}"
                     )
                     raise e
@@ -359,7 +422,8 @@ def sparse_attn_benchmark(
                     except Exception as e:
                         if "CUDA out of memory" not in str(e):
                             print(
-                                f"Error occured before running {attn_impl} with {block_size} mask "
+                                f"Error occured before running {attn_impl} with "
+                                f"{q_block_size=}, {k_block_size=} "
                                 f"when {seqlen=}, {hd=} during {wd}: {e=}"
                             )
                             raise e
@@ -395,7 +459,8 @@ def sparse_attn_benchmark(
                 except Exception as e:
                     if "CUDA out of memory" not in str(e):
                         print(
-                            f"Error occured before running {attn_impl} with {block_size} mask "
+                            f"Error occured before running {attn_impl} with "
+                            f"{q_block_size=}, {k_block_size=} "
                             f"when {seqlen=}, {hd=} during {wd}: {e=}"
                         )
                         raise e
@@ -437,7 +502,8 @@ def sparse_attn_benchmark(
             except Exception as e:
                 if "CUDA out of memory" not in str(e):
                     print(
-                        f"Error occured when running {attn_impl} with {block_size} block_size "
+                        f"Error occured when running {attn_impl} with "
+                        f"{q_block_size=}, {k_block_size=} "
                         f"when {seqlen=}, {hd=} during {wd}: {e=}"
                     )
                     raise e
@@ -447,7 +513,7 @@ def sparse_attn_benchmark(
                     # "mem": [-1, -1, -1],
                 }
                 print(
-                    f"OOM error occured when running for {attn_impl} with {block_size} block_size "
+                    f"OOM error occured when running for {attn_impl} with {q_block_size=} and {k_block_size=} block_size "
                     f"when {seqlen=}, {hd=} during {wd}: {e=}"
                 )
     else:

@@ -13,10 +13,15 @@ except Exception:
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, create_mask
 
-from longca_bench.dist_attn.benchmark.enums import FlashMaskType
-from longca_bench.utils.mask import _calc_self_attn_areas
-from magi_attention.common import AttnRanges
-from magi_attention.common.enum import AttnMaskType
+class AttnRanges:
+    pass
+class AttnMaskType:
+    pass
+try:
+    from magi_attention.common import AttnRanges
+    from magi_attention.common.enum import AttnMaskType
+except ImportError:
+    print("TODO: magi_attention is not installed")
 
 
 def calculate_attn_flops(
@@ -27,6 +32,7 @@ def calculate_attn_flops(
     num_heads_q: int,
     head_dim: int,
 ) -> dict[str, float]:
+    from longca_bench.utils.mask import _calc_self_attn_areas
     attn_area = _calc_self_attn_areas(
         q_ranges,
         k_ranges,
@@ -916,6 +922,7 @@ def generate_flashmask_indices(
     prefix_length=0,
     block_size=1024,
 ):
+    from longca_bench.dist_attn.benchmark.enums import FlashMaskType
     is_causal = True
     if flash_mask_type == FlashMaskType.FULL:
         LTS = paddle.to_tensor(
@@ -1052,14 +1059,25 @@ def seed_everything(seed=42):
 
 # availability check
 def block_sparse_available(
-    attn_impl: str, num_q_heads: int, num_kv_heads: int, block_size: int, wd: str
+    attn_impl: str,
+    num_q_heads: int,
+    num_kv_heads: int,
+    q_block_size: int,
+    k_block_size: int,
+    wd: str,
 ) -> bool:
     """
     Check availability of different block sparse attention implementations.
     """
-    if attn_impl == "vsa" or attn_impl == "vsa_triton":
-        # currently vsa only supports block size == 64
-        return num_q_heads == num_kv_heads and block_size == 64
+    if q_block_size == k_block_size:  # equal block size
+        if attn_impl == "vsa" or attn_impl == "vsa_triton":
+            # currently vsa only supports block size == 64
+            return num_q_heads == num_kv_heads and q_block_size == 64
+
+        if attn_impl == "fa2_sparse":
+            return (
+                wd == "fwd" and q_block_size == 128
+            )  # only support forward and 128 block size
 
     if attn_impl == "flashinfer":
         # flashinfer doesn't support backward
@@ -1068,7 +1086,7 @@ def block_sparse_available(
     if attn_impl == "ffa" or attn_impl == "flex":
         return True
 
-    return True
+    return False
 
 
 def var_block_sparse_available(attn_impl: str, wd: str) -> bool:

@@ -13,6 +13,11 @@ cd longca_bench/attn
 bash run_benchmark.sh
 ```
 
+sparse attention bench
+```bash
+PYTHONPATH=./ python longca_bench/attn/run_block_sparse_benchmark.py
+```
+
 
 ## Module-Level Distributed Attention Performance and Scalability
 
